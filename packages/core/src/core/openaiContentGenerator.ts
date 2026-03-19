@@ -372,7 +372,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
     }
 
     const openaiRequest: Record<string, unknown> = {
-      model: this.modelName,
+      model: request.model || this.modelName,
       messages,
     };
 
@@ -388,9 +388,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
       if (request.config.temperature !== undefined) {
         openaiRequest['temperature'] = request.config.temperature;
       }
-      if (request.config.topP !== undefined) {
-        openaiRequest['top_p'] = request.config.topP;
-      }
+      // if (request.config.topP !== undefined) {
+      //   openaiRequest['top_p'] = request.config.topP;
+      // }
       if (request.config.stopSequences !== undefined) {
         openaiRequest['stop'] = request.config.stopSequences;
       }
