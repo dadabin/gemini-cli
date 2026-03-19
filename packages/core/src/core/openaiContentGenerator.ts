@@ -91,11 +91,14 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
     async function* generateStream() {
       let buffer = '';
-      let currentToolCall: {
-        id?: string;
-        name: string;
-        arguments: string;
-      } | null = null;
+      const toolCallsByIndex = new Map<
+        number,
+        {
+          id?: string;
+          name: string;
+          arguments: string;
+        }
+      >();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -117,9 +120,11 @@ export class OpenAIContentGenerator implements ContentGenerator {
                 choices?: Array<{
                   delta?: {
                     tool_calls?: Array<{
+                      index?: number;
                       id?: string;
                       function?: { name?: string; arguments?: string };
                     }>;
+                    function_call?: { name?: string; arguments?: string };
                     content?: string;
                   };
                   finish_reason?: string;
@@ -130,18 +135,34 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
               if (delta?.tool_calls) {
                 for (const toolCall of delta.tool_calls) {
+                  const index = toolCall.index ?? 0;
                   if (toolCall.function?.name) {
-                    if (currentToolCall) {
-                      yield createGeminiToolCallResponse(currentToolCall);
-                    }
-                    currentToolCall = {
+                    toolCallsByIndex.set(index, {
                       id: toolCall.id,
                       name: toolCall.function.name,
                       arguments: toolCall.function.arguments || '',
-                    };
-                  } else if (toolCall.function?.arguments && currentToolCall) {
-                    currentToolCall.arguments += toolCall.function.arguments;
+                    });
+                  } else if (
+                    toolCall.function?.arguments &&
+                    toolCallsByIndex.has(index)
+                  ) {
+                    const current = toolCallsByIndex.get(index)!;
+                    current.arguments += toolCall.function.arguments;
                   }
+                }
+              } else if (delta?.function_call) {
+                const index = 0; // function_call doesn't have index, usually
+                if (delta.function_call.name) {
+                  toolCallsByIndex.set(index, {
+                    name: delta.function_call.name,
+                    arguments: delta.function_call.arguments || '',
+                  });
+                } else if (
+                  delta.function_call.arguments &&
+                  toolCallsByIndex.has(index)
+                ) {
+                  const current = toolCallsByIndex.get(index)!;
+                  current.arguments += delta.function_call.arguments;
                 }
               } else if (
                 delta?.content !== undefined &&
@@ -151,9 +172,17 @@ export class OpenAIContentGenerator implements ContentGenerator {
               }
 
               if (choice?.finish_reason) {
-                if (currentToolCall) {
-                  yield createGeminiToolCallResponse(currentToolCall);
-                  currentToolCall = null;
+                if (toolCallsByIndex.size > 0) {
+                  // Sort by index to ensure deterministic order
+                  const sortedIndices = Array.from(
+                    toolCallsByIndex.keys(),
+                  ).sort((a, b) => a - b);
+                  for (const index of sortedIndices) {
+                    yield createGeminiToolCallResponse(
+                      toolCallsByIndex.get(index)!,
+                    );
+                  }
+                  toolCallsByIndex.clear();
                 }
 
                 // Don't yield a STOP reason if we had tool calls, let the tool calls dictate the next turn
@@ -176,8 +205,13 @@ export class OpenAIContentGenerator implements ContentGenerator {
         }
       }
 
-      if (currentToolCall) {
-        yield createGeminiToolCallResponse(currentToolCall);
+      if (toolCallsByIndex.size > 0) {
+        const sortedIndices = Array.from(toolCallsByIndex.keys()).sort(
+          (a, b) => a - b,
+        );
+        for (const index of sortedIndices) {
+          yield createGeminiToolCallResponse(toolCallsByIndex.get(index)!);
+        }
       }
     }
 
@@ -327,9 +361,10 @@ export class OpenAIContentGenerator implements ContentGenerator {
             // If using Anthropic/Claude through an OpenAI proxy, empty text with tool calls might cause issues.
             // Some proxies require content to be explicitly null or empty string, or omit it entirely.
             // OpenAI officially allows null or empty string when tool_calls is present.
+            // Using empty string is generally more compatible with various proxies.
             messages.push({
               role: 'assistant',
-              content: contentText || null,
+              content: contentText || '',
               tool_calls: toolCalls,
             });
           } else if (toolResponseParts.length > 0) {
@@ -463,9 +498,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
       if (request.config.temperature !== undefined) {
         openaiRequest['temperature'] = request.config.temperature;
       }
-      // if (request.config.topP !== undefined) {
-      //   openaiRequest['top_p'] = request.config.topP;
-      // }
+      if (request.config.topP !== undefined) {
+        openaiRequest['top_p'] = request.config.topP;
+      }
       if (request.config.stopSequences !== undefined) {
         openaiRequest['stop'] = request.config.stopSequences;
       }
@@ -534,12 +569,21 @@ export class OpenAIContentGenerator implements ContentGenerator {
           const functionData = toolCall['function'] as Record<string, unknown>;
           parts.push({
             functionCall: {
+              id: toolCall['id'] as string,
               name: functionData['name'] as string,
               args: JSON.parse((functionData['arguments'] as string) || '{}'),
             },
           });
         }
       }
+    } else if (message?.['function_call']) {
+      const functionData = message['function_call'] as Record<string, unknown>;
+      parts.push({
+        functionCall: {
+          name: functionData['name'] as string,
+          args: JSON.parse((functionData['arguments'] as string) || '{}'),
+        },
+      });
     }
 
     const finishReason = choice?.['finish_reason'] as string | undefined;
@@ -617,23 +661,20 @@ export class OpenAIContentGenerator implements ContentGenerator {
     } catch (_e) {
       // If parsing fails, it might be incomplete, but we try our best
     }
+    const functionCall = {
+      id: toolCall.id,
+      name: toolCall.name,
+      args,
+    };
     return {
-      functionCalls: [
-        {
-          name: toolCall.name,
-          args,
-        },
-      ],
+      functionCalls: [functionCall],
       candidates: [
         {
           content: {
             role: 'model',
             parts: [
               {
-                functionCall: {
-                  name: toolCall.name,
-                  args,
-                },
+                functionCall,
               },
             ],
           },
