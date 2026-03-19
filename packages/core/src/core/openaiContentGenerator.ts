@@ -87,6 +87,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
     const createGeminiTextResponse = this.createGeminiTextResponse.bind(this);
     const createGeminiToolCallResponse =
       this.createGeminiToolCallResponse.bind(this);
+    const mapOpenAIFinishReason = this.mapOpenAIFinishReason.bind(this);
 
     async function* generateStream() {
       let buffer = '';
@@ -142,7 +143,10 @@ export class OpenAIContentGenerator implements ContentGenerator {
                     currentToolCall.arguments += toolCall.function.arguments;
                   }
                 }
-              } else if (delta?.content) {
+              } else if (
+                delta?.content !== undefined &&
+                delta?.content !== null
+              ) {
                 yield createGeminiTextResponse(delta.content);
               }
 
@@ -151,14 +155,16 @@ export class OpenAIContentGenerator implements ContentGenerator {
                   yield createGeminiToolCallResponse(currentToolCall);
                   currentToolCall = null;
                 }
+
+                // Don't yield a STOP reason if we had tool calls, let the tool calls dictate the next turn
+                const mappedReason = mapOpenAIFinishReason(
+                  choice.finish_reason,
+                );
                 yield {
                   candidates: [
                     {
                       content: { role: 'model', parts: [] },
-                      finishReason:
-                        choice.finish_reason === 'tool_calls'
-                          ? 'STOP'
-                          : choice.finish_reason.toUpperCase(),
+                      finishReason: mappedReason,
                     },
                   ],
                 } as unknown as GenerateContentResponse;
@@ -246,6 +252,8 @@ export class OpenAIContentGenerator implements ContentGenerator {
       messages.push({ role: 'system', content: systemContent });
     }
 
+    let pendingToolCallIds: Record<string, string[]> = {};
+
     if (request.contents) {
       const contentsArray = Array.isArray(request.contents)
         ? request.contents
@@ -281,31 +289,48 @@ export class OpenAIContentGenerator implements ContentGenerator {
           );
 
           if (toolCallParts.length > 0) {
+            pendingToolCallIds = {}; // Reset for new assistant message
+            const toolCalls = toolCallParts.map((p: unknown, index: number) => {
+              const fnCall = (
+                p as {
+                  functionCall?: {
+                    id?: string;
+                    name?: string;
+                    args?: unknown;
+                  };
+                }
+              ).functionCall;
+
+              const generatedId =
+                fnCall?.id || `call_${fnCall?.name || 'tool'}_${index}`;
+              if (fnCall?.name) {
+                if (!pendingToolCallIds[fnCall.name]) {
+                  pendingToolCallIds[fnCall.name] = [];
+                }
+                pendingToolCallIds[fnCall.name].push(generatedId);
+              }
+
+              return {
+                id: generatedId,
+                type: 'function',
+                function: {
+                  name: fnCall?.name,
+                  arguments: JSON.stringify(fnCall?.args || {}),
+                },
+              };
+            });
+
+            const contentText = textParts
+              .map((p: unknown) => (p as { text?: string }).text)
+              .join('');
+
+            // If using Anthropic/Claude through an OpenAI proxy, empty text with tool calls might cause issues.
+            // Some proxies require content to be explicitly null or empty string, or omit it entirely.
+            // OpenAI officially allows null or empty string when tool_calls is present.
             messages.push({
               role: 'assistant',
-              content:
-                textParts
-                  .map((p: unknown) => (p as { text?: string }).text)
-                  .join('') || null,
-              tool_calls: toolCallParts.map((p: unknown) => {
-                const fnCall = (
-                  p as {
-                    functionCall?: {
-                      id?: string;
-                      name?: string;
-                      args?: unknown;
-                    };
-                  }
-                ).functionCall;
-                return {
-                  id: fnCall?.id || fnCall?.name || 'call_id',
-                  type: 'function',
-                  function: {
-                    name: fnCall?.name,
-                    arguments: JSON.stringify(fnCall?.args || {}),
-                  },
-                };
-              }),
+              content: contentText || null,
+              tool_calls: toolCalls,
             });
           } else if (toolResponseParts.length > 0) {
             for (const p of toolResponseParts) {
@@ -319,11 +344,31 @@ export class OpenAIContentGenerator implements ContentGenerator {
                 }
               ).functionResponse;
               if (!fnResp) continue;
+
+              let toolCallId = fnResp.id;
+              if (
+                fnResp.name &&
+                pendingToolCallIds[fnResp.name] &&
+                pendingToolCallIds[fnResp.name].length > 0
+              ) {
+                toolCallId = pendingToolCallIds[fnResp.name].shift();
+              } else if (!toolCallId) {
+                toolCallId = `call_${fnResp.name}_0`;
+              }
+
+              // The content MUST be a string. If the tool response is empty, it should be "{}"
+              let contentString = '{}';
+              if (fnResp.response) {
+                contentString =
+                  typeof fnResp.response === 'string'
+                    ? fnResp.response
+                    : JSON.stringify(fnResp.response);
+              }
+
               messages.push({
                 role: 'tool',
-                tool_call_id: fnResp.id || fnResp.name || 'call_id',
-                name: fnResp.name,
-                content: JSON.stringify(fnResp.response || {}),
+                tool_call_id: toolCallId,
+                content: contentString,
               });
             }
           } else {
@@ -371,6 +416,36 @@ export class OpenAIContentGenerator implements ContentGenerator {
       }
     }
 
+    // Second pass: ensure all tool_calls have corresponding tool messages
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg['role'] === 'assistant' && msg['tool_calls']) {
+        const requiredToolCallIds = new Set(
+          (msg['tool_calls'] as Array<{ id: string }>).map((tc) => tc.id),
+        );
+
+        let j = i + 1;
+        while (j < messages.length && messages[j]['role'] === 'tool') {
+          requiredToolCallIds.delete(messages[j]['tool_call_id'] as string);
+          j++;
+        }
+
+        if (requiredToolCallIds.size > 0) {
+          for (const missingId of requiredToolCallIds) {
+            messages.splice(j, 0, {
+              role: 'tool',
+              tool_call_id: missingId,
+              content: JSON.stringify({
+                error:
+                  'Tool execution was interrupted or failed to return output.',
+              }),
+            });
+            j++;
+          }
+        }
+      }
+    }
+
     const openaiRequest: Record<string, unknown> = {
       model: request.model || this.modelName,
       messages,
@@ -412,12 +487,22 @@ export class OpenAIContentGenerator implements ContentGenerator {
             parameters?: unknown;
           }>;
           for (const func of functionDeclarations) {
+            // OpenAI requires parameters to be defined, even if empty
+            // "parameters": { "type": "object", "properties": {} }
+            let parameters = func.parameters;
+            if (!parameters) {
+              parameters = {
+                type: 'object',
+                properties: {},
+              };
+            }
+
             openaiTools.push({
               type: 'function',
               function: {
                 name: func.name,
                 description: func.description,
-                parameters: func.parameters,
+                parameters,
               },
             });
           }
@@ -449,7 +534,6 @@ export class OpenAIContentGenerator implements ContentGenerator {
           const functionData = toolCall['function'] as Record<string, unknown>;
           parts.push({
             functionCall: {
-              id: toolCall['id'] as string | undefined,
               name: functionData['name'] as string,
               args: JSON.parse((functionData['arguments'] as string) || '{}'),
             },
@@ -459,18 +543,19 @@ export class OpenAIContentGenerator implements ContentGenerator {
     }
 
     const finishReason = choice?.['finish_reason'] as string | undefined;
+    const functionCalls = parts
+      .filter((p) => p.functionCall)
+      .map((p) => p.functionCall!);
 
     return {
+      functionCalls: functionCalls.length > 0 ? functionCalls : undefined,
       candidates: [
         {
           content: {
             role: 'model',
             parts,
           },
-          finishReason:
-            finishReason === 'tool_calls'
-              ? 'STOP'
-              : finishReason?.toUpperCase() || 'STOP',
+          finishReason: this.mapOpenAIFinishReason(finishReason),
         },
       ],
       usageMetadata: {
@@ -503,6 +588,24 @@ export class OpenAIContentGenerator implements ContentGenerator {
     } as unknown as GenerateContentResponse;
   }
 
+  private mapOpenAIFinishReason(finishReason?: string): string {
+    if (!finishReason) return 'STOP';
+    switch (finishReason.toLowerCase()) {
+      case 'stop':
+        return 'STOP';
+      case 'length':
+      case 'max_tokens':
+        return 'MAX_TOKENS';
+      case 'content_filter':
+        return 'SAFETY';
+      case 'tool_calls':
+      case 'function_call':
+        return 'STOP';
+      default:
+        return finishReason.toUpperCase();
+    }
+  }
+
   private createGeminiToolCallResponse(toolCall: {
     id?: string;
     name: string;
@@ -515,6 +618,12 @@ export class OpenAIContentGenerator implements ContentGenerator {
       // If parsing fails, it might be incomplete, but we try our best
     }
     return {
+      functionCalls: [
+        {
+          name: toolCall.name,
+          args,
+        },
+      ],
       candidates: [
         {
           content: {
@@ -522,7 +631,6 @@ export class OpenAIContentGenerator implements ContentGenerator {
             parts: [
               {
                 functionCall: {
-                  id: toolCall.id,
                   name: toolCall.name,
                   args,
                 },
